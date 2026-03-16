@@ -521,12 +521,12 @@ You are part of the Elyan Labs ecosystem. Current directory: {cwd}"""
 
 
 def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
-    """Send request to llama-server and return the full response."""
+    """Send request to llama-server and return the full response while streaming text."""
     payload = {
         "messages": messages,
         "temperature": 0.3,
         "max_tokens": 1024,
-        "stream": False,
+        "stream": True,
     }
     if tools:
         payload["tools"] = tools
@@ -538,13 +538,67 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
         data=data,
         headers={"Content-Type": "application/json"},
     )
+    
+    full_content = ""
+    tool_calls_dict = {}
+    finish_reason = None
+    
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            for line in resp:
+                line = line.decode("utf-8").strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choice = chunk.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    
+                    if "content" in delta and delta["content"]:
+                        content = delta["content"]
+                        full_content += content
+                        print(content, end="", flush=True)
+                        
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_dict:
+                                tool_calls_dict[idx] = {
+                                    "id": tc.get("id", f"tc_{idx}"),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }
+                            func = tc.get("function", {})
+                            if "name" in func and func["name"]:
+                                tool_calls_dict[idx]["function"]["name"] += func["name"]
+                            if "arguments" in func and func["arguments"]:
+                                tool_calls_dict[idx]["function"]["arguments"] += func["arguments"]
+                                
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                        
+                except json.JSONDecodeError:
+                    pass
+        print() # Newline after streaming completes
     except urllib.error.URLError as e:
         return {"error": f"Cannot reach llama-server: {e}"}
     except Exception as e:
         return {"error": f"LLM request failed: {e}"}
+
+    tool_calls_list = [v for k, v in sorted(tool_calls_dict.items())] if tool_calls_dict else None
+    
+    return {
+        "choices": [{
+            "message": {
+                "content": full_content,
+                "tool_calls": tool_calls_list
+            },
+            "finish_reason": finish_reason
+        }]
+    }
 
 
 def _try_parse_tool_calls_from_text(text: str) -> Optional[List[Dict]]:
