@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-TrashClaw v0.2 — Full Tool-Use Agent for Vintage Mac Hardware
-=============================================================
-A local LLM agent with real tool capabilities: file read/write/edit,
-shell execution, code search, directory exploration, multi-step reasoning.
+TrashClaw v0.2 — Local Tool-Use Agent
+======================================
+A general-purpose agent powered by a local LLM. Reads files, writes files,
+runs commands, searches codebases, fetches URLs, processes data — whatever
+you need. OpenClaw-style tool-use loop with zero external dependencies.
 
-Zero external dependencies. Pure Python stdlib. Python 3.7+.
-Built by Elyan Labs on a 2013 Mac Pro trashcan.
+Pure Python stdlib. Python 3.7+. Works with any OpenAI-compatible server.
 """
 
 import os
@@ -409,25 +409,31 @@ TOOL_DISPATCH = {
 
 # ── LLM Client ──
 
-SYSTEM_PROMPT = """You are TrashClaw, a powerful coding agent running locally on vintage hardware (2013 Mac Pro trashcan).
+SYSTEM_PROMPT = """You are TrashClaw, a general-purpose local agent running on the user's machine.
+
+You can accomplish any task that involves files, commands, or information on this system.
+You are not limited to coding — you handle research, system administration, file management,
+data processing, automation, and anything else the user asks.
 
 You have access to these tools:
 - read_file: Read file contents with optional line range
 - write_file: Create or overwrite files
 - edit_file: Replace exact strings in files (must match uniquely)
-- run_command: Execute shell commands (git, build, test, etc.)
+- run_command: Execute shell commands (curl, git, grep, python, anything installed)
 - search_files: Grep for patterns across files
 - find_files: Find files by glob pattern
 - list_dir: List directory contents
-- think: Reason through a problem before acting
+- think: Reason through a problem step by step before acting
 
 IMPORTANT RULES:
 1. Always read a file before editing it.
 2. Use edit_file for surgical changes, write_file for new files.
 3. Use think to plan multi-step tasks before starting.
-4. Be concise. You're on vintage hardware — every token counts.
-5. After making changes, verify them (read the file, run tests).
+4. Be concise — every token counts.
+5. After making changes, verify them.
 6. If a command might be destructive, explain what it does first.
+7. Use run_command freely — curl for web requests, python for computation, etc.
+8. Chain tools together to accomplish complex tasks autonomously.
 
 You are part of the Elyan Labs ecosystem. Current directory: {cwd}"""
 
@@ -724,7 +730,7 @@ def banner():
     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\033[0m
 
     \033[1mElyan Labs\033[0m | Mac Pro Trashcan Edition | v0.2
-    Tool-use agent with file read/write/edit, shell, search, and multi-step reasoning.
+    General-purpose agent — files, commands, search, automation, anything local.
     Model: {model} | CWD: {cwd}
     Type /help for commands, or just describe what you want to do.
 """.format(model=MODEL_NAME, cwd=CWD))
