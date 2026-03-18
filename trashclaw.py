@@ -39,7 +39,7 @@ else:
     import readline
 
 # ── Config ──
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".trashclaw")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
@@ -389,6 +389,36 @@ TOOLS = [
                 "required": ["message"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Apply a unified diff patch to a file. Better than edit_file for multi-line changes. Use standard unified diff format with @@ hunk headers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to patch"},
+                    "patch": {"type": "string", "description": "Unified diff patch text (with @@ headers, +/- lines)"}
+                },
+                "required": ["path", "patch"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clipboard",
+            "description": "Read from or write to the system clipboard. Use 'paste' to read, 'copy' to write.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "'copy' or 'paste'", "enum": ["copy", "paste"]},
+                    "content": {"type": "string", "description": "Text to copy (only needed for 'copy' action)"}
+                },
+                "required": ["action"]
+            }
+        }
     }
 ]
 
@@ -477,7 +507,7 @@ def _load_project_instructions() -> str:
 
 SLASH_COMMANDS = ["/about", "/achievements", "/cd", "/clear", "/compact",
                   "/config", "/exit", "/export", "/help", "/load", "/model",
-                  "/quit", "/save", "/sessions", "/status", "/undo"]
+                  "/plugins", "/quit", "/save", "/sessions", "/status", "/undo"]
 
 
 def _setup_tab_completion():
@@ -889,6 +919,102 @@ def tool_git_commit(message: str) -> str:
         return f"Error running git commit: {e}"
 
 
+def tool_patch_file(path: str, patch: str) -> str:
+    """Apply a unified diff patch to a file. More powerful than edit_file for multi-line changes."""
+    path = _resolve_path(path)
+    try:
+        with open(path, "r") as f:
+            original_lines = f.readlines()
+    except FileNotFoundError:
+        original_lines = []
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    _save_undo(path, "patch")
+
+    # Parse unified diff hunks
+    result_lines = list(original_lines)
+    offset = 0
+    hunk_re = re.compile(r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+
+    current_pos = None
+    removals = []
+    additions = []
+
+    for line in patch.split("\n"):
+        m = hunk_re.match(line)
+        if m:
+            # Apply previous hunk
+            if current_pos is not None:
+                start = current_pos - 1 + offset
+                for _ in removals:
+                    if start < len(result_lines):
+                        result_lines.pop(start)
+                        offset -= 1
+                for i, add_line in enumerate(additions):
+                    result_lines.insert(start + i, add_line + "\n")
+                    offset += 1
+            current_pos = int(m.group(1))
+            removals = []
+            additions = []
+        elif line.startswith("-") and not line.startswith("---"):
+            removals.append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions.append(line[1:])
+
+    # Apply last hunk
+    if current_pos is not None:
+        start = current_pos - 1 + offset
+        for _ in removals:
+            if start < len(result_lines):
+                result_lines.pop(start)
+                offset -= 1
+        for i, add_line in enumerate(additions):
+            result_lines.insert(start + i, add_line + "\n")
+
+    try:
+        with open(path, "w") as f:
+            f.writelines(result_lines)
+        return f"Patched {path} ({len(additions)} additions, {len(removals)} removals)"
+    except Exception as e:
+        return f"Error writing {path}: {e}"
+
+
+def tool_clipboard(action: str = "paste", content: str = "") -> str:
+    """Interact with system clipboard. Action: 'copy' or 'paste'."""
+    if action == "paste":
+        # Try multiple clipboard commands
+        for cmd in [["xclip", "-selection", "clipboard", "-o"],
+                    ["xsel", "--clipboard", "--output"],
+                    ["pbpaste"],
+                    ["powershell.exe", "-command", "Get-Clipboard"]]:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    text = r.stdout
+                    if len(text) > MAX_OUTPUT_CHARS:
+                        return text[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(text)} chars)"
+                    return text if text else "(clipboard is empty)"
+            except (FileNotFoundError, Exception):
+                continue
+        return "Error: No clipboard tool found (install xclip, xsel, or use macOS/Windows)"
+    elif action == "copy":
+        if not content:
+            return "Error: Nothing to copy"
+        for cmd in [["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"],
+                    ["pbcopy"],
+                    ["clip.exe"]]:
+            try:
+                r = subprocess.run(cmd, input=content, capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return f"Copied {len(content)} chars to clipboard"
+            except (FileNotFoundError, Exception):
+                continue
+        return "Error: No clipboard tool found"
+    return f"Error: Unknown clipboard action '{action}'. Use 'copy' or 'paste'."
+
+
 def tool_think(thought: str) -> str:
     return f"[Thought recorded, no side effects]"
 
@@ -907,7 +1033,64 @@ TOOL_DISPATCH = {
     "git_status": lambda args: tool_git_status(),
     "git_diff": lambda args: tool_git_diff(args.get("staged", False)),
     "git_commit": lambda args: tool_git_commit(args["message"]),
+    "patch_file": lambda args: tool_patch_file(args["path"], args["patch"]),
+    "clipboard": lambda args: tool_clipboard(args.get("action", "paste"), args.get("content", "")),
 }
+
+
+# ── Plugin System ──
+
+PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
+
+def _load_plugins():
+    """Load custom tools from ~/.trashclaw/plugins/*.py
+
+    Each plugin file should define:
+      TOOL_DEF = {"name": "...", "description": "...", "parameters": {...}}
+      def run(**kwargs) -> str: ...
+    """
+    if not os.path.isdir(PLUGINS_DIR):
+        return
+
+    loaded = 0
+    for fname in sorted(os.listdir(PLUGINS_DIR)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        fpath = os.path.join(PLUGINS_DIR, fname)
+        try:
+            # Execute plugin in isolated namespace
+            ns = {"__file__": fpath, "__name__": fname[:-3]}
+            with open(fpath, 'r') as f:
+                exec(compile(f.read(), fpath, 'exec'), ns)
+
+            tool_def = ns.get("TOOL_DEF")
+            run_fn = ns.get("run")
+            if not tool_def or not run_fn or not callable(run_fn):
+                continue
+
+            name = tool_def.get("name", fname[:-3])
+            if name in TOOL_DISPATCH:
+                continue  # Don't override built-in tools
+
+            # Register the tool
+            TOOLS.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool_def.get("description", f"Plugin: {name}"),
+                    "parameters": tool_def.get("parameters", {
+                        "type": "object", "properties": {}, "required": []
+                    })
+                }
+            })
+            TOOL_DISPATCH[name] = lambda args, fn=run_fn: fn(**args)
+            TOOL_NAMES.add(name)
+            loaded += 1
+        except Exception as e:
+            print(f"  \033[33m[plugin]\033[0m Failed to load {fname}: {e}")
+
+    if loaded > 0:
+        print(f"  \033[32m[plugins]\033[0m Loaded {loaded} plugin{'s' if loaded != 1 else ''} from {PLUGINS_DIR}")
 
 
 def detect_project_context() -> str:
@@ -962,6 +1145,8 @@ You have access to these tools:
 - git_status: Show modified, staged, and untracked files
 - git_diff: Show unstaged or staged changes
 - git_commit: Stage all changes and commit
+- patch_file: Apply unified diff patches (better than edit_file for multi-line changes)
+- clipboard: Read from or write to system clipboard
 - think: Reason through a problem step by step before acting
 
 IMPORTANT RULES:
@@ -1265,6 +1450,10 @@ def _agent_loop(round_limit: int):
                 print(f"  \033[35m[git]\033[0m diff ({staged})")
             elif tool_name == "git_commit":
                 print(f"  \033[35m[git]\033[0m commit: {args.get('message', '?')[:60]}")
+            elif tool_name == "patch_file":
+                print(f"  \033[33m[patch]\033[0m {args.get('path', '?')}")
+            elif tool_name == "clipboard":
+                print(f"  \033[34m[clipboard]\033[0m {args.get('action', '?')}")
 
             # Execute
             handler = TOOL_DISPATCH.get(tool_name)
@@ -1405,6 +1594,26 @@ def handle_slash(cmd: str) -> bool:
                         print(f"    - {name} ({msg_count} messages, saved {saved_at})")
                     except:
                         print(f"    - {name} (unreadable)")
+
+    elif command == "/plugins":
+        if not os.path.isdir(PLUGINS_DIR):
+            print(f"  No plugins directory. Create {PLUGINS_DIR}/ and add .py files.")
+            print(f"\n  \033[1mPlugin format:\033[0m")
+            print(f"  TOOL_DEF = {{'name': 'my_tool', 'description': '...', 'parameters': {{...}}}}")
+            print(f"  def run(**kwargs) -> str: ...")
+        else:
+            plugins = [f for f in os.listdir(PLUGINS_DIR) if f.endswith('.py') and not f.startswith('_')]
+            builtin_count = 14  # built-in tools
+            plugin_count = len(TOOLS) - builtin_count
+            if not plugins:
+                print(f"  Plugin directory exists but no plugins found.")
+            else:
+                print(f"  \033[1mPlugins\033[0m ({PLUGINS_DIR})")
+                for p in sorted(plugins):
+                    loaded = any(t["function"]["name"] == p[:-3] for t in TOOLS)
+                    status = "\033[32mloaded\033[0m" if loaded else "\033[31mfailed\033[0m"
+                    print(f"    {p} [{status}]")
+            print(f"\n  Total tools: {len(TOOLS)} ({builtin_count} built-in + {plugin_count} plugins)")
 
     elif command == "/about":
         hw = _detect_hardware()
@@ -1666,6 +1875,7 @@ def main():
     _save_achievements(ACHIEVEMENTS)
 
     banner()
+    _load_plugins()
 
     # Backend Detection
     backend = "Unknown"
