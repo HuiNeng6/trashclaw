@@ -74,6 +74,8 @@ HISTORY: List[Dict] = []
 UNDO_STACK: List[Dict] = []  # [{path, content_before, action}]
 APPROVED_COMMANDS: set = set()
 EXTRA_SYSTEM_PROMPT: str = ""
+LAST_ASSISTANT_RESPONSE: str = ""  # For /pipe command
+LAST_GENERATION_STATS: Dict = {}  # {tokens, seconds, tokens_per_sec} for /stats
 ACHIEVEMENTS_FILE = os.path.join(CONFIG_DIR, "achievements.json")
 
 # ── Trashy's Soul ──
@@ -522,7 +524,7 @@ def _load_project_instructions() -> str:
 
 SLASH_COMMANDS = ["/about", "/achievements", "/add", "/cd", "/clear", "/compact",
                   "/config", "/diff", "/exit", "/export", "/help", "/load", "/model",
-                  "/plugins", "/quit", "/remember", "/save", "/sessions", "/status", "/undo"]
+                  "/pipe", "/plugins", "/quit", "/remember", "/save", "/sessions", "/status", "/undo"]
 
 
 def _setup_tab_completion():
@@ -1252,6 +1254,8 @@ def llm_request_with_retry(messages: List[Dict], tools: List[Dict] = None) -> Di
 
 def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
     """Send request to llama-server and return the full response while streaming text."""
+    global LAST_GENERATION_STATS
+    
     payload = {
         "messages": messages,
         "temperature": 0.3,
@@ -1272,6 +1276,8 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
     full_content = ""
     tool_calls_dict = {}
     finish_reason = None
+    start_time = time.time()
+    token_count = 0
     
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
@@ -1292,6 +1298,7 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
                     if "content" in delta and delta["content"]:
                         content = delta["content"]
                         full_content += content
+                        token_count += len(content) // 4  # Rough estimate: 4 chars per token
                         print(content, end="", flush=True)
                         
                     if "tool_calls" in delta and delta["tool_calls"]:
@@ -1321,6 +1328,15 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
         return {"error": f"LLM request failed: {e}"}
 
     tool_calls_list = [v for k, v in sorted(tool_calls_dict.items())] if tool_calls_dict else None
+    
+    # Calculate and store generation stats
+    elapsed = time.time() - start_time
+    tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
+    LAST_GENERATION_STATS = {
+        "tokens": token_count,
+        "seconds": elapsed,
+        "tokens_per_sec": tokens_per_sec
+    }
     
     return {
         "choices": [{
@@ -1475,6 +1491,8 @@ def _agent_loop(round_limit: int):
             if content:
                 print(content)
             HISTORY.append({"role": "assistant", "content": content})
+            global LAST_ASSISTANT_RESPONSE
+            LAST_ASSISTANT_RESPONSE = content
             return
 
         # Execute tool calls
@@ -1871,6 +1889,42 @@ def handle_slash(cmd: str) -> bool:
         except Exception as e:
             print(f"  Export failed: {e}")
 
+    elif command == "/pipe":
+        # Save last assistant response to file
+        global LAST_ASSISTANT_RESPONSE
+        if not arg:
+            print("  Usage: /pipe <filename>")
+            print("  Saves the last assistant response to the specified file.")
+        elif not LAST_ASSISTANT_RESPONSE:
+            print("  Error: No assistant response to save yet.")
+        else:
+            pipe_path = _resolve_path(arg)
+            try:
+                os.makedirs(os.path.dirname(pipe_path), exist_ok=True)
+                with open(pipe_path, 'w', encoding='utf-8') as f:
+                    f.write(LAST_ASSISTANT_RESPONSE)
+                lines = LAST_ASSISTANT_RESPONSE.count('\n') + 1
+                print(f"  Piped last response to {pipe_path} ({len(LAST_ASSISTANT_RESPONSE)} bytes, {lines} lines)")
+            except Exception as e:
+                print(f"  Error: {e}")
+
+    elif command == "/stats":
+        # Show generation stats from last turn
+        if not LAST_GENERATION_STATS:
+            print("  No generation stats available yet.")
+            print("  Stats are shown automatically after each assistant response.")
+        else:
+            stats = LAST_GENERATION_STATS
+            print(f"\n  \033[1mGeneration Stats\033[0m")
+            print(f"  Tokens: {stats.get('tokens', 'N/A')}")
+            print(f"  Time: {stats.get('seconds', 'N/A'):.2f}s" if isinstance(stats.get('seconds'), (int, float)) else f"  Time: {stats.get('seconds', 'N/A')}")
+            tps = stats.get('tokens_per_sec')
+            if isinstance(tps, (int, float)):
+                print(f"  Speed: {tps:.1f} tokens/sec")
+            else:
+                print(f"  Speed: {tps}")
+            print()
+
     elif command == "/undo":
         if not UNDO_STACK:
             print("  Nothing to undo.")
@@ -1952,6 +2006,8 @@ def handle_slash(cmd: str) -> bool:
   /sessions      List saved sessions
   /model <name>  Switch model mid-session
   /export [name] Export conversation as markdown
+  /pipe <file>   Save last assistant response to file
+  /stats         Show generation stats (tokens, time, tokens/sec)
   /remember <text>  Save a note to project memory (.trashclaw/memory.json)
   /undo          Undo last file write or edit
   /config        Show/set persistent config
@@ -1984,6 +2040,8 @@ def handle_slash(cmd: str) -> bool:
   Auto-compacts context when conversation gets too long.
   Git branch shown in prompt when in a repo.
   /undo rolls back file writes and edits.
+  /pipe saves last response to a file.
+  /stats shows generation speed (tokens/sec).
   .trashclaw.md in project root = custom instructions for agent.
 
   Just type naturally. TrashClaw will use tools autonomously.
