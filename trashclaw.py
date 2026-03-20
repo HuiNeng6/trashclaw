@@ -171,6 +171,7 @@ APPROVED_COMMANDS: set = set()
 EXTRA_SYSTEM_PROMPT: str = ""
 LAST_ASSISTANT_RESPONSE: str = ""  # For /pipe command
 LAST_GENERATION_STATS: Dict = {}  # {tokens, seconds, tokens_per_sec} for /stats
+SESSION_STATS: Dict = {"total_tokens": 0, "total_seconds": 0.0, "turns": 0}  # Cumulative session stats
 ACHIEVEMENTS_FILE = os.path.join(CONFIG_DIR, "achievements.json")
 
 # ── Trashy's Soul ──
@@ -1441,6 +1442,9 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
         "seconds": elapsed,
         "tokens_per_sec": tokens_per_sec
     }
+    SESSION_STATS["total_tokens"] += token_count
+    SESSION_STATS["total_seconds"] += elapsed
+    SESSION_STATS["turns"] += 1
     
     return {
         "choices": [{
@@ -1732,6 +1736,10 @@ def handle_slash(cmd: str) -> bool:
         print(f"  Max rounds: {MAX_TOOL_ROUNDS} | Shell approval: {'on' if APPROVE_SHELL else 'off'}")
         if APPROVED_COMMANDS:
             print(f"  Auto-approved: {', '.join(sorted(APPROVED_COMMANDS))}")
+        s = SESSION_STATS
+        if s["turns"] > 0:
+            avg_tps = s["total_tokens"] / s["total_seconds"] if s["total_seconds"] > 0 else 0
+            print(f"  Generation: {s['total_tokens']} tokens in {s['turns']} turns ({avg_tps:.1f} avg tok/s)")
 
     elif command == "/compact":
         # Keep only last 10 messages
@@ -2025,13 +2033,13 @@ def handle_slash(cmd: str) -> bool:
                 print(f"  Error: {e}")
 
     elif command == "/stats":
-        # Show generation stats from last turn
+        # Show generation stats from last turn + cumulative session stats
         if not LAST_GENERATION_STATS:
             print("  No generation stats available yet.")
             print("  Stats are shown automatically after each assistant response.")
         else:
             stats = LAST_GENERATION_STATS
-            print(f"\n  \033[1mGeneration Stats\033[0m")
+            print(f"\n  \033[1mLast Turn\033[0m")
             print(f"  Tokens: {stats.get('tokens', 'N/A')}")
             print(f"  Time: {stats.get('seconds', 'N/A'):.2f}s" if isinstance(stats.get('seconds'), (int, float)) else f"  Time: {stats.get('seconds', 'N/A')}")
             tps = stats.get('tokens_per_sec')
@@ -2039,6 +2047,16 @@ def handle_slash(cmd: str) -> bool:
                 print(f"  Speed: {tps:.1f} tokens/sec")
             else:
                 print(f"  Speed: {tps}")
+
+            # Cumulative session stats
+            s = SESSION_STATS
+            if s["turns"] > 0:
+                avg_tps = s["total_tokens"] / s["total_seconds"] if s["total_seconds"] > 0 else 0
+                print(f"\n  \033[1mSession Total\033[0m")
+                print(f"  Turns: {s['turns']}")
+                print(f"  Tokens: {s['total_tokens']}")
+                print(f"  Time: {s['total_seconds']:.2f}s")
+                print(f"  Avg speed: {avg_tps:.1f} tokens/sec")
             print()
 
     elif command == "/undo":
