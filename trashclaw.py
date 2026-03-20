@@ -516,6 +516,20 @@ TOOLS = [
                 "required": ["action"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": "Load an image file to view and analyze it. Supports PNG, JPG, GIF, WebP, BMP. The image will be included in the conversation for visual analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the image file to view"}
+                },
+                "required": ["path"]
+            }
+        }
     }
 ]
 
@@ -629,7 +643,7 @@ def _load_project_instructions() -> str:
 
 SLASH_COMMANDS = ["/about", "/achievements", "/add", "/cd", "/clear", "/compact",
                   "/config", "/diff", "/exit", "/export", "/help", "/load", "/model",
-                  "/pipe", "/plugins", "/quit", "/remember", "/save", "/sessions", "/status", "/undo"]
+                  "/image", "/pipe", "/plugins", "/quit", "/remember", "/save", "/screenshot", "/sessions", "/status", "/undo"]
 
 
 def _setup_tab_completion():
@@ -1141,6 +1155,93 @@ def tool_think(thought: str) -> str:
     return f"[Thought recorded, no side effects]"
 
 
+# ── Vision Support ──
+
+VISION_SUPPORTED: Optional[bool] = None  # None = not yet checked
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+PENDING_IMAGE: Optional[Dict] = None  # {"path": str, "base64": str, "media_type": str}
+
+
+def _check_vision_support() -> bool:
+    """Check if the model supports vision by querying /v1/models."""
+    global VISION_SUPPORTED
+    if VISION_SUPPORTED is not None:
+        return VISION_SUPPORTED
+
+    # Known vision-capable model name patterns
+    vision_keywords = ["llava", "qwen-vl", "qwen2-vl", "bakllava", "obsidian",
+                       "minicpm-v", "cogvlm", "internvl", "vision", "vl-",
+                       "gemini", "gpt-4o", "gpt-4-vision", "claude"]
+
+    model_lower = MODEL_NAME.lower()
+    for kw in vision_keywords:
+        if kw in model_lower:
+            VISION_SUPPORTED = True
+            return True
+
+    # Try /v1/models endpoint for multimodal info
+    try:
+        req = urllib.request.Request(f"{LLAMA_URL}/v1/models")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for m in data.get("data", []):
+                model_id = m.get("id", "").lower()
+                for kw in vision_keywords:
+                    if kw in model_id:
+                        VISION_SUPPORTED = True
+                        return True
+    except Exception:
+        pass
+
+    # Default: assume not supported but let the user try
+    VISION_SUPPORTED = False
+    return False
+
+
+def _get_media_type(path: str) -> str:
+    """Get MIME media type from file extension."""
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }.get(ext, "image/png")
+
+
+def tool_view_image(path: str) -> str:
+    """Read an image file and queue it for inclusion in the next LLM request."""
+    global PENDING_IMAGE
+    resolved = _resolve_path(path)
+    if not os.path.exists(resolved):
+        return f"Error: File not found: {resolved}"
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in SUPPORTED_IMAGE_EXTS:
+        return f"Error: Unsupported image format '{ext}'. Supported: {', '.join(sorted(SUPPORTED_IMAGE_EXTS))}"
+
+    try:
+        size = os.path.getsize(resolved)
+        if size > 20 * 1024 * 1024:  # 20MB limit
+            return f"Error: Image too large ({size // 1024 // 1024}MB). Max 20MB."
+
+        import base64
+        with open(resolved, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+
+        media_type = _get_media_type(resolved)
+        PENDING_IMAGE = {
+            "path": resolved,
+            "base64": img_data,
+            "media_type": media_type,
+        }
+        return f"Image loaded: {os.path.basename(resolved)} ({size:,} bytes, {media_type}). It will be included in my next response."
+    except Exception as e:
+        return f"Error reading image: {e}"
+
+
 # Tool dispatch
 TOOL_DISPATCH = {
     "read_file": lambda args: tool_read_file(args["path"], args.get("offset"), args.get("limit")),
@@ -1157,6 +1258,7 @@ TOOL_DISPATCH = {
     "git_commit": lambda args: tool_git_commit(args["message"]),
     "patch_file": lambda args: tool_patch_file(args["path"], args["patch"]),
     "clipboard": lambda args: tool_clipboard(args.get("action", "paste"), args.get("content", "")),
+    "view_image": lambda args: tool_view_image(args["path"]),
 }
 
 
@@ -1520,7 +1622,25 @@ def agent_turn(user_message: str):
     """Run the full agent loop: LLM thinks, calls tools, observes, repeats."""
     global _INTERRUPTED
     _INTERRUPTED = False
-    HISTORY.append({"role": "user", "content": user_message})
+    global PENDING_IMAGE
+    if PENDING_IMAGE:
+        # Include image in the user message using OpenAI vision format
+        HISTORY.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_message},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{PENDING_IMAGE['media_type']};base64,{PENDING_IMAGE['base64']}"
+                    }
+                }
+            ]
+        })
+        print(f"  \033[90m[📷 image attached: {os.path.basename(PENDING_IMAGE['path'])}]\033[0m")
+        PENDING_IMAGE = None
+    else:
+        HISTORY.append({"role": "user", "content": user_message})
     ACHIEVEMENTS["stats"]["total_turns"] = ACHIEVEMENTS["stats"].get("total_turns", 0) + 1
     _auto_compact()
 
@@ -1661,6 +1781,8 @@ def _agent_loop(round_limit: int):
                 print(f"  \033[33m[patch]\033[0m {args.get('path', '?')}")
             elif tool_name == "clipboard":
                 print(f"  \033[34m[clipboard]\033[0m {args.get('action', '?')}")
+            elif tool_name == "view_image":
+                print(f"  \033[34m[image]\033[0m {args.get('path', '?')}")
 
             # Execute
             handler = TOOL_DISPATCH.get(tool_name)
@@ -2041,6 +2163,86 @@ def handle_slash(cmd: str) -> bool:
                 print(f"  Speed: {tps}")
             print()
 
+    elif command == "/screenshot":
+        # Take a screenshot and include it in the next message
+        if not _check_vision_support():
+            print("  \033[33mWarning: Current model may not support vision.\033[0m")
+            print("  Screenshot will be taken anyway — if the model can't process it, you'll get a text-only response.")
+
+        import base64 as _b64
+        screenshot_path = os.path.join(CWD, ".trashclaw_screenshot.png")
+        took_screenshot = False
+
+        # Try platform-specific screenshot tools (no external deps)
+        if sys.platform == "darwin":
+            # macOS: screencapture
+            ret = subprocess.run(["screencapture", "-x", screenshot_path],
+                                 capture_output=True, timeout=10)
+            took_screenshot = ret.returncode == 0
+        elif sys.platform.startswith("linux"):
+            # Linux: try import + scrot + gnome-screenshot
+            for cmd in [
+                ["import", "-window", "root", screenshot_path],
+                ["scrot", screenshot_path],
+                ["gnome-screenshot", "-f", screenshot_path],
+            ]:
+                try:
+                    ret = subprocess.run(cmd, capture_output=True, timeout=10)
+                    if ret.returncode == 0:
+                        took_screenshot = True
+                        break
+                except FileNotFoundError:
+                    continue
+        elif sys.platform == "win32":
+            # Windows: PowerShell snippet
+            ps_cmd = (
+                f'Add-Type -AssemblyName System.Windows.Forms;'
+                f'[System.Windows.Forms.Screen]::PrimaryScreen | ForEach-Object {{'
+                f'$bmp = New-Object Drawing.Bitmap($_.Bounds.Width, $_.Bounds.Height);'
+                f'$g = [Drawing.Graphics]::FromImage($bmp);'
+                f'$g.CopyFromScreen($_.Bounds.Location, [Drawing.Point]::Empty, $_.Bounds.Size);'
+                f'$bmp.Save("{screenshot_path}")}}'
+            )
+            ret = subprocess.run(["powershell", "-Command", ps_cmd],
+                                 capture_output=True, timeout=15)
+            took_screenshot = ret.returncode == 0
+
+        if took_screenshot and os.path.exists(screenshot_path):
+            global PENDING_IMAGE
+            size = os.path.getsize(screenshot_path)
+            with open(screenshot_path, "rb") as f:
+                img_data = _b64.b64encode(f.read()).decode("utf-8")
+            PENDING_IMAGE = {
+                "path": screenshot_path,
+                "base64": img_data,
+                "media_type": "image/png",
+            }
+            print(f"  📸 Screenshot taken ({size:,} bytes). It will be included in your next message.")
+            # Clean up the temp file
+            try:
+                os.remove(screenshot_path)
+            except Exception:
+                pass
+        else:
+            print("  Error: Could not take screenshot.")
+            print("  Make sure you have a screenshot tool installed:")
+            if sys.platform.startswith("linux"):
+                print("    sudo apt install scrot  (or imagemagick for 'import')")
+            elif sys.platform == "darwin":
+                print("    screencapture should be available by default")
+            elif sys.platform == "win32":
+                print("    PowerShell should be available by default")
+
+    elif command == "/image":
+        # Load an image file for the next message
+        if not arg:
+            print("  Usage: /image <path>")
+        else:
+            result = tool_view_image(arg)
+            if not _check_vision_support():
+                print("  \033[33mWarning: Current model may not support vision.\033[0m")
+            print(f"  {result}")
+
     elif command == "/undo":
         if not UNDO_STACK:
             print("  Nothing to undo.")
@@ -2123,6 +2325,8 @@ def handle_slash(cmd: str) -> bool:
   /model <name>  Switch model mid-session
   /export [name] Export conversation as markdown
   /pipe <file>   Save last assistant response to file
+  /image <path>  Load an image for the next message (vision models)
+  /screenshot    Take a screenshot for the next message (vision models)
   /stats         Show generation stats (tokens, time, tokens/sec)
   /remember <text>  Save a note to project memory (.trashclaw/memory.json)
   /undo          Undo last file write or edit
@@ -2158,6 +2362,7 @@ def handle_slash(cmd: str) -> bool:
   /undo rolls back file writes and edits.
   /pipe saves last response to a file.
   /stats shows generation speed (tokens/sec).
+  /image and /screenshot work with vision-capable models (Llava, Qwen-VL, etc.).
   .trashclaw.md in project root = custom instructions for agent.
 
   Just type naturally. TrashClaw will use tools autonomously.
