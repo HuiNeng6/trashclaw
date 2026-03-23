@@ -13,5 +13,6 @@ Thank you to all the amazing people who have contributed to TrashClaw!
 | MrJHSN | [@MrJHSN](https://github.com/MrJHSN) | Multi-backend PR |
 | ryan-the-zilla | [@ryan-the-zilla](https://github.com/ryan-the-zilla) | CONTRIBUTING.md |
 | Zby-coding | [@Zby-coding](https://github.com/Zby-coding) | CONTRIBUTORS.md |
+| 慧能 | [@HuiNeng6](https://github.com/HuiNeng6) | CONTRIBUTORS.md |
 
 This project follows the [all-contributors](https://allcontributors.org) specification.
